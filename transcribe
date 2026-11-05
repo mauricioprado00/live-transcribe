@@ -1,0 +1,4 @@
+#!/bin/sh
+# Live transcription of microphone + speaker output; see live_transcribe.py --help.
+here=$(dirname "$(readlink -f "$0")")
+exec "$here/.venv/bin/python" "$here/live_transcribe.py" "$@"
