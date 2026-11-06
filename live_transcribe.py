@@ -11,6 +11,7 @@ import argparse
 import datetime as dt
 import os
 import queue
+import shutil
 import signal
 import subprocess
 import sys
@@ -53,6 +54,7 @@ class Segmenter:
         self.reset()
 
     def reset(self):
+        self.uid = getattr(self, "uid", 0) + 1  # identifies the utterance in progress
         self.frames = []  # (frame, rms, is_speech)
         self.quiet_run = 0
         self.started_at = None
@@ -61,10 +63,22 @@ class Segmenter:
         if sum(s for _, _, s in frames) < self.min_speech_frames:
             return None
         audio = np.concatenate([f for f, _, _ in frames]).astype(np.float32) / 32768.0
-        return (self.started_at, audio)
+        return (self.uid, self.started_at, audio)
+
+    def flush(self):
+        """Ends the utterance in progress, if any; for when capture stops."""
+        result = self.emit(self.frames) if self.frames else None
+        self.reset()
+        return result
+
+    def in_progress(self):
+        """(uid, start_time, audio) of the utterance so far, once it holds enough speech."""
+        if not self.frames:
+            return None
+        return self.emit(self.frames)
 
     def feed(self, frame, now):
-        """Returns (start_time, audio) when an utterance completes, else None."""
+        """Returns (uid, start_time, audio) when an utterance completes, else None."""
         rms = float(np.sqrt(np.mean(frame.astype(np.float32) ** 2)))
         self.recent_rms.append(rms)
         del self.recent_rms[: -self.FLOOR_FRAMES]
@@ -100,26 +114,94 @@ class Segmenter:
         return None
 
 
-def capture(label, device, args, chunks, stop):
-    cmd = [
-        "parec", "--raw", "--latency-msec=100", "-d", device,
-        f"--rate={RATE}", "--channels=1", "--format=s16le",
-    ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    seg = Segmenter(args.silence, args.max_len, args.min_speech, args.threshold)
-    nbytes = FRAME * 2
-    try:
-        while not stop.is_set():
-            data = proc.stdout.read(nbytes)
-            if len(data) < nbytes:
-                if not stop.is_set():
-                    print(f"[{label}] capture from {device} ended", file=sys.stderr)
-                break
-            out = seg.feed(np.frombuffer(data, dtype=np.int16), time.time())
+class Source:
+    """One recorded stream: its segmenter, and the finished utterances awaiting transcription."""
+
+    def __init__(self, label, device, args):
+        self.label = label
+        self.device = device
+        self.seg = Segmenter(args.silence, args.max_len, args.min_speech, args.threshold)
+        self.lock = threading.Lock()  # guards seg between the capture and worker threads
+        self.finals = queue.Queue()
+        self.captured = threading.Event()  # set when capture has ended
+
+    def capture(self, stop):
+        cmd = [
+            "parec", "--raw", "--latency-msec=100", "-d", self.device,
+            f"--rate={RATE}", "--channels=1", "--format=s16le",
+        ]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        nbytes = FRAME * 2
+        try:
+            while not stop.is_set():
+                data = proc.stdout.read(nbytes)
+                if len(data) < nbytes:
+                    if not stop.is_set():
+                        print(f"[{self.label}] capture from {self.device} ended", file=sys.stderr)
+                    break
+                with self.lock:
+                    out = self.seg.feed(np.frombuffer(data, dtype=np.int16), time.time())
+                if out:
+                    self.finals.put(out)
+        finally:
+            proc.terminate()
+            with self.lock:
+                out = self.seg.flush()
             if out:
-                chunks.put((label, *out))
-    finally:
-        proc.terminate()
+                self.finals.put(out)
+            self.captured.set()
+
+
+class Display:
+    """Final lines scroll up; below them, one draft line per source is redrawn in place."""
+
+    def __init__(self, labels, out_file, show_partials, show_lag):
+        self.labels = labels
+        self.out_file = out_file
+        self.show_partials = show_partials
+        self.show_lag = show_lag
+        self.partials = {}
+        self.drawn = 0
+        self.lock = threading.Lock()
+
+    def _erase(self):
+        if self.drawn:
+            sys.stdout.write(f"\033[{self.drawn}F\033[J")
+            self.drawn = 0
+
+    def _draw(self):
+        width = shutil.get_terminal_size().columns
+        for label in self.labels:
+            text = self.partials.get(label)
+            if not text:
+                continue
+            room = width - len(label) - 4
+            if len(text) > room:  # keep to one line, so it can be erased; show the newest words
+                text = "…" + text[-(room - 1):]
+            sys.stdout.write(f"{COLOURS[label]}{label}{RESET}  {DIM}{text}{RESET}\n")
+            self.drawn += 1
+        sys.stdout.flush()
+
+    def partial(self, label, text):
+        if not self.show_partials:
+            return
+        with self.lock:
+            self._erase()
+            self.partials[label] = text
+            self._draw()
+
+    def final(self, label, started, audio, text):
+        with self.lock:
+            self._erase()
+            self.partials.pop(label, None)
+            if text:
+                stamp = dt.datetime.fromtimestamp(started).strftime("%H:%M:%S")
+                lag = time.time() - started - len(audio) / RATE
+                sys.stdout.write(f"{DIM}{stamp}{RESET} {COLOURS[label]}{label}{RESET}  {text}"
+                                 + (f" {DIM}(+{lag:.0f}s){RESET}" if self.show_lag else "") + "\n")
+                self.out_file.write(f"[{stamp}] {label}: {text}\n")
+                self.out_file.flush()
+            self._draw()
 
 
 def is_hallucination(seg):
@@ -128,38 +210,63 @@ def is_hallucination(seg):
     return (seg.no_speech_prob > 0.6 and seg.avg_logprob < -0.8) or seg.compression_ratio > 2.4
 
 
-def transcribe_loop(model, args, chunks, out_file, stop):
-    while not stop.is_set() or not chunks.empty():
+def pick_language(model, args, audio):
+    if len(args.languages) <= 1:
+        return args.languages[0] if args.languages else None
+    # Pick the likeliest of the allowed languages; free detection on a short
+    # phrase often lands on an unrelated one.
+    _, _, probs = model.detect_language(audio)
+    probs = dict(probs)
+    return max(args.languages, key=lambda l: probs.get(l, 0.0))
+
+
+def transcribe(model, audio, language, beam_size, temperature):
+    segments, _ = model.transcribe(
+        audio,
+        language=language,
+        beam_size=beam_size,
+        vad_filter=True,
+        condition_on_previous_text=False,
+        temperature=temperature,
+    )
+    return " ".join(s.text.strip() for s in segments if not is_hallucination(s)).strip()
+
+
+def worker(model, draft_model, args, src, display):
+    """Transcribes src's finished utterances as they come and, while none is
+    waiting, redrafts the one in progress every --partial-interval seconds
+    with the (smaller, faster) draft model."""
+    drafted = (None, 0.0)  # (uid, seconds of audio) of the last draft
+    draft_lang = (None, None)  # (uid, language) so drafts detect it only once
+    while True:
         try:
-            label, started, audio = chunks.get(timeout=0.2)
+            uid, started, audio = src.finals.get(timeout=0.05)
         except queue.Empty:
+            if src.captured.is_set() and src.finals.empty():
+                return  # capture queues its last utterance before setting captured
+            if args.partial_interval <= 0:
+                continue
+            with src.lock:
+                current = src.seg.in_progress()
+            if not current:
+                continue
+            uid, started, audio = current
+            secs = len(audio) / RATE
+            if secs < 0.7 or (uid == drafted[0] and secs - drafted[1] < args.partial_interval):
+                continue
+            drafted = (uid, secs)
+            if draft_lang[0] != uid:
+                draft_lang = (uid, pick_language(draft_model, args, audio))
+            # Greedy, no fallback: a draft has to be quick, not perfect.
+            text = transcribe(draft_model, audio, draft_lang[1], 1, 0.0)
+            if text and src.finals.empty():  # else the final is already waiting
+                display.partial(src.label, text)
             continue
-        language = args.languages[0] if len(args.languages) == 1 else None
-        if len(args.languages) > 1:
-            # Pick the likeliest of the allowed languages; free detection on a
-            # short phrase often lands on an unrelated one.
-            _, _, probs = model.detect_language(audio)
-            probs = dict(probs)
-            language = max(args.languages, key=lambda l: probs.get(l, 0.0))
-        segments, _ = model.transcribe(
-            audio,
-            language=language,
-            beam_size=args.beam_size,
-            vad_filter=True,
-            condition_on_previous_text=False,
-            # One retry at most: the default six-step fallback can stall a
-            # worker for many seconds on a hard utterance.
-            temperature=(0.0, 0.4),
-        )
-        text = " ".join(s.text.strip() for s in segments if not is_hallucination(s)).strip()
-        if not text:
-            continue
-        stamp = dt.datetime.fromtimestamp(started).strftime("%H:%M:%S")
-        lag = time.time() - started - len(audio) / RATE
-        print(f"{DIM}{stamp}{RESET} {COLOURS[label]}{label}{RESET}  {text}"
-              + (f" {DIM}(+{lag:.0f}s){RESET}" if args.show_lag else ""), flush=True)
-        out_file.write(f"[{stamp}] {label}: {text}\n")
-        out_file.flush()
+        text = transcribe(model, audio, pick_language(model, args, audio), args.beam_size,
+                          # One retry at most: the default six-step fallback can
+                          # stall a worker for many seconds on a hard utterance.
+                          (0.0, 0.4))
+        display.final(src.label, started, audio, text)
 
 
 def main():
@@ -182,15 +289,20 @@ def main():
     p.add_argument("--beam-size", type=int, default=1, help="1 is fastest; 5 is a little more accurate")
     p.add_argument("--threads", type=int, default=max(1, (os.cpu_count() or 4) - 2))
     p.add_argument("--device", default="cpu", help="cpu or cuda")
+    p.add_argument("--partial-interval", type=float, default=0.5,
+                   help="seconds between drafts of the phrase being spoken; 0 shows only final lines")
+    p.add_argument("--draft-model", default="tiny",
+                   help="model for the drafts shown while a phrase is spoken (default tiny); "
+                        "the final line always comes from --model")
     p.add_argument("--show-lag", action="store_true", help="show how far behind real time each line is")
     args = p.parse_args()
     args.languages = [l.strip() for l in args.language.split(",")] if args.language else []
 
     sources = []
     if not args.no_mic:
-        sources.append(("mic", args.mic))
+        sources.append(Source("mic", args.mic, args))
     if not args.no_out:
-        sources.append(("out", args.out))
+        sources.append(Source("out", args.out, args))
     if not sources:
         p.error("nothing to record")
 
@@ -204,26 +316,29 @@ def main():
     print(f"{DIM}loading model {args.model}...{RESET}", file=sys.stderr)
     compute = "int8" if args.device == "cpu" else "float16"
     # One worker per source, so the mic and the output are transcribed in parallel.
-    model = WhisperModel(args.model, device=args.device, compute_type=compute,
-                         cpu_threads=max(1, args.threads // len(sources)), num_workers=len(sources))
+    def load(name):
+        return WhisperModel(name, device=args.device, compute_type=compute,
+                            cpu_threads=max(1, args.threads // len(sources)), num_workers=len(sources))
+    model = load(args.model)
+    draft_model = model
+    if args.partial_interval > 0 and args.draft_model != args.model:
+        draft_model = load(args.draft_model)
 
     stop = threading.Event()
-    chunks = queue.Queue()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
 
     with open(args.output, "a", encoding="utf-8") as out_file:
-        threads = [threading.Thread(target=capture, args=(lbl, dev, args, chunks, stop), daemon=True)
-                   for lbl, dev in sources]
-        for t in threads:
+        display = Display([s.label for s in sources], out_file,
+                          show_partials=sys.stdout.isatty() and args.partial_interval > 0,
+                          show_lag=args.show_lag)
+        captures = [threading.Thread(target=s.capture, args=(stop,), daemon=True) for s in sources]
+        workers = [threading.Thread(target=worker, args=(model, draft_model, args, s, display)) for s in sources]
+        for t in captures + workers:
             t.start()
-        print(f"{DIM}listening to {', '.join(l for l, _ in sources)}; writing {args.output}; Ctrl-C to stop{RESET}",
-              file=sys.stderr)
-        workers = [threading.Thread(target=transcribe_loop, args=(model, args, chunks, out_file, stop))
-                   for _ in sources]
-        for w in workers:
-            w.start()
+        print(f"{DIM}listening to {', '.join(s.label for s in sources)}; writing {args.output}; "
+              f"Ctrl-C to stop{RESET}", file=sys.stderr)
         try:
-            while all(w.is_alive() for w in workers) and any(t.is_alive() for t in threads):
+            while any(w.is_alive() for w in workers):
                 time.sleep(0.5)
         except KeyboardInterrupt:
             pass

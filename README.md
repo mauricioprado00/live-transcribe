@@ -5,12 +5,19 @@ speakers/headphones play, using [faster-whisper](https://github.com/SYSTRAN/fast
 on the CPU. Lines are labelled `mic` (you) and `out` (the other side of a call,
 a video, ...), printed as they come and appended to `transcripts/<date>_<time>.txt`.
 
+While someone is still speaking, a dim draft of the phrase so far is shown under
+the last line and redrawn about twice a second; when the phrase ends it is
+replaced by the final text. Drafts come from the fast `tiny` model and are
+only shown in the terminal; the transcript file gets the final lines only.
+
     ./transcribe                 # small model, language detected per utterance
     ./transcribe -l es           # fix the language: better accuracy on short phrases
     ./transcribe -l es,en,el     # choose among these per utterance, never anything else
     ./transcribe -m medium       # slower, more accurate; turbo / large-v3 also work
     ./transcribe --no-mic        # only what is playing
     ./transcribe --show-lag      # how far behind real time each line arrives
+    ./transcribe --draft-model base     # better drafts, updated less often
+    ./transcribe --partial-interval 0   # no drafts, final lines only
 
 Ctrl-C stops; audio already captured is still transcribed before it exits.
 
